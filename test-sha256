@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+
+declare -A files=(
+	[files/empty.txt]='e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+	[files/hello.txt]='5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03'
+	[files/random_4kb.bin]='b822f930e9b0c646c177c80b7fa9781cb9941613c419900e34f16ce5023b38c7'
+)
+
+code=0
+for file in "${!files[@]}"; do
+	want=${files[$file]}
+	have=$(./sha256 < "$file")
+
+	echo -n "checking $file is $want... "
+
+	if [[ "$want" == "$have" ]]; then
+		echo 'ok'
+	else
+		echo "fail! we have '$have'"
+		code=1
+	fi
+done
+
+exit "$code"
