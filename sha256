@@ -414,6 +414,10 @@ pipe-consumer() {
 		decode-record
 		process-block
 	done
+
+	# a leftover partial record means the producer stopped mid-stream
+	[[ -z $rec ]] || return 1
+
 	print-hash
 }
 
@@ -447,6 +451,13 @@ main() {
 	else
 		pipe-producer | pipe-consumer
 	fi
+
+	# read cannot tell a failed producer from end of input, so check both
+	# halves.  The plain status catches the redirection failing outright,
+	# in which case neither half ran and PIPESTATUS is stale.
+	local status=$? pipe=("${PIPESTATUS[@]}")
+	(( status == 0 )) || return 1
+	(( pipe[0] == 0 && pipe[1] == 0 ))
 }
 
 main "$@"

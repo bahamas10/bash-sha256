@@ -83,7 +83,7 @@ for ((v = 0; v < 256; v++)); do
 		head -c 300 /dev/zero > "$tmp/f"
 	else
 		printf -v byte '\\x%02x' "$v"
-		printf '%b' "$(printf "$byte%.0s" {1..300})" > "$tmp/f"
+		printf "$byte%.0s" {1..300} > "$tmp/f"
 	fi
 	check "$tmp/f" "300 x byte $v"
 done
