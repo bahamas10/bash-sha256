@@ -43,7 +43,8 @@ check() {
 }
 
 nonul() {
-	head -c "$(($1 * 4 + 64))" /dev/urandom | tr -d '\000' | head -c "$1"
+	# Read from an unbounded stream so we always produce exactly $1 non-NUL bytes.
+	tr -d '\000' < /dev/urandom | head -c "$1"
 }
 
 echo 'lengths 0..200 and the block/chunk boundaries...'
