@@ -62,7 +62,7 @@ rightrotate() {
 	local num=$1
 	local rot=$2
 
-	echo "$(( (num >> rot) | (num << (32 - rot)) ))"
+	REPLY="$(( (num >> rot) | (num << (32 - rot)) ))"
 }
 
 process-block() {
