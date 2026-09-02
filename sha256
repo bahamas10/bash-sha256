@@ -209,7 +209,7 @@ process-input() {
 	local low_bits=$(( (byte_count << 3) & U32_MASK))
 	local high_bits=$(( (byte_count >> (32 - 3)) & U32_MASK ))
 
-	# encode the full 64bit int (bits length) as little endian
+	# encode the full 64bit int (bits length) as big endian
 	local byte
 	for ((i = 3; i >= 0; i--)); do
 		byte=$(( high_bits >> (i * 8) & 0xff ))
