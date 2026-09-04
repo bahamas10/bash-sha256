@@ -395,19 +395,19 @@ process-input-debug() {
 # bash reads a pipe one byte at a time in line mode, but in bulk when it knows
 # the count.
 
-pipe-producer() {
-	# the ingest is shared with single-process mode; only what a finished
-	# block does changes.  The pipeline runs this in a subshell, so the
-	# redefinition cannot escape.
+# the body is a subshell, so shadowing process-block here cannot escape.  The
+# ingest is shared with single-process mode, and only what a finished block
+# does changes.
+pipe-producer() (
 	process-block() {
-		printf '%11d%11d%11d%11d%11d%11d%11d%11d%11d%11d%11d%11d%11d%11d%11d%11d' \
+		printf '%11d' \
 			"$(( w0 & M ))" "$(( w1 & M ))" "$(( w2 & M ))" "$(( w3 & M ))" \
 			"$(( w4 & M ))" "$(( w5 & M ))" "$(( w6 & M ))" "$(( w7 & M ))" \
 			"$(( w8 & M ))" "$(( w9 & M ))" "$(( w10 & M ))" "$(( w11 & M ))" \
 			"$(( w12 & M ))" "$(( w13 & M ))" "$(( w14 & M ))" "$(( w15 & M ))"
 	}
 	process-input
-}
+)
 
 pipe-consumer() {
 	while IFS= read -r -N "$RECLEN" rec; do
