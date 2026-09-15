@@ -62,7 +62,7 @@ rightrotate() {
 	local num=$1
 	local rot=$2
 
-	echo "$(( (num >> rot) | (num << (32 - rot)) ))"
+	REPLY="$(( (num >> rot) | (num << (32 - rot)) ))"
 }
 
 process-block() {
@@ -120,7 +120,7 @@ process-block() {
 			((e >> 25) | (e << (32 - 25)))
 		))
 		ch=$(( (e & f) ^ ((~e) & g) ))
-		temp1=$(( (h + S1 + ch +k[i] + w[i]) & U32_MASK ))
+		temp1=$(( (h + S1 + ch + k[i] + w[i]) & U32_MASK ))
 		S0=$((
 			((a >> 2) | (a << (32 - 2))) ^
 			((a >> 13) | (a << (32 - 13))) ^
@@ -209,7 +209,7 @@ process-input() {
 	local low_bits=$(( (byte_count << 3) & U32_MASK))
 	local high_bits=$(( (byte_count >> (32 - 3)) & U32_MASK ))
 
-	# encode the full 64bit int (bits length) as little endian
+	# encode the full 64bit int (bits length) as big endian
 	local byte
 	for ((i = 3; i >= 0; i--)); do
 		byte=$(( high_bits >> (i * 8) & 0xff ))
