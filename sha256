@@ -7,6 +7,7 @@
 #   $ ./sha256 file.txt
 #   $ ./sha256 < file.bin
 #   $ DEBUG=1 ./sha256 < file.bin
+#   $ SHA256_PROCS=1 ./sha256 file.txt
 #
 # # Created
 # Author: Dave Eddy <ysap@daveeddy.com>
@@ -18,10 +19,21 @@
 
 LC_ALL=C
 
-U32_MASK=0xffffffff
+M=0xffffffff
 
-block=()
-byte_count=0
+# multiplying a 32-bit value by this puts it in v|v<<32 form, where ROTR(v,n)
+# is a single >>n read instead of a two-read (v>>n|v<<32-n)
+DUP=4294967297
+
+# a multiple of 64, so a full read ends on a block boundary
+CHUNK=512
+
+# longest run of NUL bytes counted before handing work downstream
+NULRUN=4096
+
+# the producer's record: 16 words as 11-char fields
+FIELD=11
+RECLEN=$((16 * FIELD))
 
 # Initialize hash values:
 # (first 32 bits of the fractional parts of the square roots of the first 8
@@ -57,130 +69,308 @@ k=(
 	0x90befffa 0xa4506ceb 0xbef9a3f7 0xc67178f2
 )
 
-# unused: this was inlined for speed
-rightrotate() {
-	local num=$1
-	local rot=$2
+# the message schedule, w[0..15], as scalars
+w0=0 w1=0 w2=0 w3=0 w4=0 w5=0 w6=0 w7=0
+w8=0 w9=0 w10=0 w11=0 w12=0 w13=0 w14=0 w15=0
 
-	REPLY="$(( (num >> rot) | (num << (32 - rot)) ))"
+# partial block: W[0..qn-1] whole words, plus pn bytes of a partial word in pw.
+# Only NUL bytes, EOF and padding land here.
+W=(0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0)
+qn=0
+pn=0
+pw=0
+byte_count=0
+
+# scratch, global on purpose: with a local frame every variable read in the
+# hot path pays for a second hash lookup
+s=
+blk=
+rec=
+n=
+i=
+lim=
+code=
+req=
+z=
+zr=
+
+# byte -> integer, so a byte decodes with a parameter expansion rather than a
+# printf.  NUL is absent: read -d '' stops at NUL, so NUL bytes are injected
+# out of band as numbers.
+declare -A ord=()
+for ((v = 1; v < 256; v++)); do
+	printf -v c '%02x' "$v"
+	printf -v c "\\x$c"
+	ord[$c]=$v
+done
+unset v c
+
+# ---------------------------------------------------------------------------
+# The hot path is built as unrolled arithmetic at startup rather than written
+# out, because bash charges ~1200ns per command it dispatches and ~115ns per
+# variable it reads in an expression, so what is fast here is 15 KB of straight
+# line arithmetic that nobody could maintain by hand.  Costs ~4ms once.
+# ---------------------------------------------------------------------------
+
+# the 64 rounds, as one comma-separated arithmetic expression
+build-core() {
+	local base=(a b c d e f g h)
+	local parts=() r A B C D E F G H j x y z
+
+	parts+=("a=h0*$DUP,b=h1*$DUP,c=h2*$DUP,d=h3*$DUP")
+	parts+=("e=h4*$DUP,f=h5*$DUP,g=h6*$DUP,h=h7*$DUP")
+
+	for ((r = 0; r < 64; r++)); do
+		# the a..h rotation, done by renaming rather than copying
+		A=${base[((0 - r) % 8 + 8) % 8]}
+		B=${base[((1 - r) % 8 + 8) % 8]}
+		C=${base[((2 - r) % 8 + 8) % 8]}
+		D=${base[((3 - r) % 8 + 8) % 8]}
+		E=${base[((4 - r) % 8 + 8) % 8]}
+		F=${base[((5 - r) % 8 + 8) % 8]}
+		G=${base[((6 - r) % 8 + 8) % 8]}
+		H=${base[((7 - r) % 8 + 8) % 8]}
+
+		j=$((r & 15))
+
+		if ((r >= 16)); then
+			# w[j] += s0(w[j+1]) + w[j+9] + s1(w[j+14]).  On a
+			# doubled register, X>>n is ROTR(v,n) in the low 32
+			# bits; SHR needs the wrapped bits masked off.
+			x=w$(((r + 1) & 15))
+			y=w$(((r + 9) & 15))
+			z=w$(((r + 14) & 15))
+			parts+=("w$j=((w$j+($x>>7^$x>>18^($x>>3)&0x1fffffff)+$y+($z>>17^$z>>19^($z>>10)&0x3fffff))&$M)*$DUP")
+		fi
+
+		# S0/S1 are left unmasked: their high bits only feed sums that
+		# get masked back to 32 bits below
+		parts+=("T=$H+($E>>6^$E>>11^$E>>25)+(($E&$F)^(~$E&$G))+${k[r]}+w$j")
+		parts+=("$D=(($D+T)&$M)*$DUP")
+		parts+=("$H=((T+($A>>2^$A>>13^$A>>22)+(($A&$B)^($C&($A^$B))))&$M)*$DUP")
+	done
+
+	parts+=("h0=(h0+a)&$M,h1=(h1+b)&$M,h2=(h2+c)&$M,h3=(h3+d)&$M")
+	parts+=("h4=(h4+e)&$M,h5=(h5+f)&$M,h6=(h6+g)&$M,h7=(h7+h)&$M")
+
+	local IFS=,
+	CORE=${parts[*]}
 }
 
-process-block() {
-	# create a 64-entry message schedule array w[0..63] of 32-bit words
-	# (The initial values in w[0..63] don't matter, so many implementations
-	# zero them here)
-	# copy chunk into first 16 words w[0..15] of the message schedule array
-	local w=()
-
-	# break chunk into sixteen 4 byte / 32-bit words w[0..15]
-	local i j
+# w0..w15 from 64 literal offsets into $blk
+build-load() {
+	local parts=() i o
 	for ((i = 0; i < 16; i++)); do
-		j=$((i * 4))
-		w[i]=$((block[j] << 24 | block[j+1] << 16 |
-			block[j+2] << 8 | block[j+3]))
+		o=$((i * 4))
+		parts+=("w$i=(\${ord[\${blk:$o:1}]}<<24|\${ord[\${blk:$((o + 1)):1}]}<<16|\${ord[\${blk:$((o + 2)):1}]}<<8|\${ord[\${blk:$((o + 3)):1}]})*$DUP")
 	done
-
-	# Extend the first 16 words into the remaining 48 words w[16..63] of the
-	# message schedule array:
-	local s0 s1
-	for ((i = 16; i < 64; i++)); do
-		s0=$((
-			(
-				((w[i-15] >> 7) | (w[i-15] << (32 - 7))) ^
-				((w[i-15] >> 18) | (w[i-15] << (32 - 18))) ^
-				(w[i-15] >> 3)
-			) & U32_MASK
-		))
-		s1=$((
-			(
-				((w[i-2] >> 17) | (w[i-2] << (32 - 17))) ^
-				((w[i-2] >> 19) | (w[i-2] << (32 - 19))) ^
-				(w[i-2] >> 10)
-			) & U32_MASK
-		))
-		w[i]=$(( (w[i-16] + s0 + w[i-7] + s1) & U32_MASK ))
-	done
-
-	# Initialize working variables to current hash value:
-	local a=$h0
-	local b=$h1
-	local c=$h2
-	local d=$h3
-	local e=$h4
-	local f=$h5
-	local g=$h6
-	local h=$h7
-
-	# Compression function main loop:
-	local S1 ch temp1 S0 maj temp2
-	for ((i = 0; i < 64; i++)); do
-		S1=$((
-			((e >> 6) | (e << (32 - 6))) ^
-			((e >> 11) | (e << (32 - 11))) ^
-			((e >> 25) | (e << (32 - 25)))
-		))
-		ch=$(( (e & f) ^ ((~e) & g) ))
-		temp1=$(( (h + S1 + ch + k[i] + w[i]) & U32_MASK ))
-		S0=$((
-			((a >> 2) | (a << (32 - 2))) ^
-			((a >> 13) | (a << (32 - 13))) ^
-			((a >> 22) | (a << (32 - 22)))
-		))
-		maj=$(( (a & b) ^ (a & c) ^ (b & c) ))
-		temp2=$(( (S0 + maj) & U32_MASK ))
-
-		h=$g
-		g=$f
-		f=$e
-		e=$(( (d + temp1) & U32_MASK ))
-		d=$c
-		c=$b
-		b=$a
-		a=$(( (temp1 + temp2) & U32_MASK ))
-	done
-
-	# Add the compressed chunk to the current hash value:
-	h0=$(( (h0 + a) & U32_MASK ))
-	h1=$(( (h1 + b) & U32_MASK ))
-	h2=$(( (h2 + c) & U32_MASK ))
-	h3=$(( (h3 + d) & U32_MASK ))
-	h4=$(( (h4 + e) & U32_MASK ))
-	h5=$(( (h5 + f) & U32_MASK ))
-	h6=$(( (h6 + g) & U32_MASK ))
-	h7=$(( (h7 + h) & U32_MASK ))
+	local IFS=,
+	LOAD=${parts[*]}
 }
 
-process-byte() {
-	local byte=$1
+# slice a record back into w0..w15
+build-decode() {
+	local parts=() i
+	for ((i = 0; i < 16; i++)); do
+		parts+=("w$i=\${rec:$((i * FIELD)):$FIELD}*$DUP")
+	done
+	local IFS=,
+	DECODE=${parts[*]}
+}
 
-	debug "process-byte($byte)"
+# append one word from $s at offset $i, and one byte likewise.  Inlined into
+# process-input, because a call would cost more than the work they do.
+build-word() {
+	printf -v WORD '(( W[qn] = (${ord[${s:i:1}]}<<24|${ord[${s:i+1:1}]}<<16|${ord[${s:i+2:1}]}<<8|${ord[${s:i+3:1}]})*%s, i += 4, ++qn == 16 )) && flush-block' "$DUP"
+}
+build-byte() {
+	printf -v BYTE '(( pw = pw << 8 | ${ord[${s:i:1}]}, ++i, ++pn == 4 )) && { (( W[qn] = pw * %s, pw = 0, pn = 0, ++qn == 16 )) && flush-block; }' "$DUP"
+}
 
-	# store the byte
-	block+=("$byte")
+build-core
+build-load
+build-decode
+build-word
+build-byte
 
-	# check if we have a full block ready for processing
-	if ((${#block[@]} == 64)); then
-		process-block
-		block=()
+# compress w0..w15 into h0..h7, decode a block, decode a record
+eval "process-block() { (( $CORE )); }"
+eval "load-block()    { (( $LOAD )); }"
+eval "decode-record() { (( $DECODE )); }"
+
+# ---------------------------------------------------------------------------
+
+debug() {
+	if [[ -n $DEBUG ]]; then
+		echo '[DEBUG]' "$@" >&2
 	fi
+	return 0
 }
 
+# hand a slow-path block to the compressor
+flush-block() {
+	(( w0=W[0],w1=W[1],w2=W[2],w3=W[3],w4=W[4],w5=W[5],w6=W[6],w7=W[7],w8=W[8],w9=W[9],w10=W[10],w11=W[11],w12=W[12],w13=W[13],w14=W[14],w15=W[15] ))
+	process-block
+	qn=0
+}
+
+# append one byte to the partial block; off the fast path only
+process-byte() {
+	(( pw = pw << 8 | $1, ++pn == 4 )) || return 0
+	(( W[qn] = pw * DUP, pw = 0, pn = 0, ++qn == 16 )) && flush-block
+	return 0
+}
+
+# append $1 NUL bytes.  'read' can only report them one at a time, so the
+# caller counts a run and we apply it in bulk.
+process-zeros() {
+	# zr, not z: the caller keeps its own count in z
+	zr=$1
+	(( byte_count += zr ))
+
+	# close out the block we are in the middle of
+	while (( zr && (qn || pn) )); do
+		process-byte 0
+		(( zr-- ))
+	done
+
+	# The zeroing is outside the loop on purpose: the message schedule maps
+	# all-zero to all-zero, so w0..w15 are still zero after each block.
+	if (( zr >= 64 )); then
+		(( w0=0,w1=0,w2=0,w3=0,w4=0,w5=0,w6=0,w7=0,w8=0,w9=0,w10=0,w11=0,w12=0,w13=0,w14=0,w15=0 ))
+		while (( zr >= 64 )); do
+			process-block
+			(( zr -= 64 ))
+		done
+	fi
+
+	while (( zr )); do
+		process-byte 0
+		(( zr-- ))
+	done
+}
+
+# pad the message, append its length, emit the last block(s)
+finalize() {
+	# the 1 bit, then 0s out to a word boundary
+	(( pw = (pw << 8 | 0x80) << ((3 - pn) * 8), W[qn] = pw * DUP, ++qn ))
+
+	# the length needs the last two words
+	if (( qn > 14 )); then
+		while (( qn < 16 )); do
+			(( W[qn] = 0, ++qn ))
+		done
+		flush-block
+	fi
+	while (( qn < 14 )); do
+		(( W[qn] = 0, ++qn ))
+	done
+
+	# original length in bits, big endian
+	(( W[14] = ((byte_count >> 29) & M) * DUP, W[15] = ((byte_count << 3) & M) * DUP ))
+	flush-block
+}
+
+# process-input is eval'd because its two hot loops inline the generated word
+# and byte appends; a call for either would cost more than the append itself.
+eval '
 process-input() {
-	local chunk i c
+	req=$CHUNK
+
+	while true; do
+		IFS= read -r -d "" -n "$req" s
+		code=$?
+		n=${#s}
+
+		if (( n )); then
+			i=0
+
+			# a NUL knocked us out of alignment; close out the
+			# block we are in the middle of
+			if (( qn || pn )); then
+				lim=$(( 64 - qn * 4 - pn ))
+				(( lim > n )) && lim=$n
+				while (( pn && i < lim )); do
+					'"$BYTE"'
+				done
+				while (( i + 4 <= lim )); do
+					'"$WORD"'
+				done
+				while (( i < lim )); do
+					'"$BYTE"'
+				done
+			fi
+
+			# the fast path
+			while (( i + 64 <= n )); do
+				blk=${s:i:64}
+				load-block
+				process-block
+				(( i += 64 ))
+			done
+
+			while (( i + 4 <= n )); do
+				'"$WORD"'
+			done
+			while (( i < n )); do
+				'"$BYTE"'
+			done
+
+			(( byte_count += n ))
+		fi
+
+		# "read" failed - so we are done processing
+		(( code )) && break
+
+		# a full read means no NUL was involved
+		if (( n == req )); then
+			req=$(( CHUNK - qn * 4 - pn ))
+			continue
+		fi
+
+		# a short read means "read" stopped on its NUL delimiter, which
+		# it consumed but cannot store.  Count the run, but stop at
+		# NULRUN: nothing reaches the consumer while we are counting.
+		z=1
+		s=
+		while (( z < NULRUN )); do
+			IFS= read -r -d "" -n 1 s || break
+			[[ -n $s ]] && break
+			(( z++ ))
+		done
+		process-zeros "$z"
+
+		if [[ -n $s ]]; then
+			process-byte "${ord[$s]}"
+			(( byte_count++ ))
+		elif (( z < NULRUN )); then
+			break
+		fi
+
+		req=$(( CHUNK - qn * 4 - pn ))
+	done
+
+	finalize
+}'
+
+unset CORE LOAD DECODE WORD BYTE
+
+# the same thing written the obvious way, used only when DEBUG is set
+process-input-debug() {
+	local chunk c
 
 	while true; do
 		IFS= read -r -d '' -n 4096 chunk
-		local code=$?
-		local n=${#chunk}
+		code=$?
+		n=${#chunk}
 
 		debug "read $n bytes (code=$code)"
 
-		# loop the chunk and process byte-by-byte
 		for ((i = 0; i < n; i++)); do
-			c=${chunk:i:1}
-			printf -v c '%d' "'$c"
+			c=${ord[${chunk:i:1}]}
+			debug "process-byte($c)"
 			process-byte "$c"
-			((byte_count++))
+			(( byte_count++ ))
 		done
 
 		# `read` failed - so we are done processing
@@ -190,50 +380,45 @@ process-input() {
 
 		# check for nul
 		if ((n < 4096)); then
+			debug 'process-byte(0)'
 			process-byte 0
-			((byte_count++))
+			(( byte_count++ ))
 		fi
 	done
 
-	# we've read the entire message - now we have to finalize it by padding
-	# it and appending the length
-
-	# pad it with 1 and then a bunch of 0s
-	process-byte 0x80
-	while (( ${#block[@]} != 56 )); do
-		process-byte 0
-	done
-
-	# append original length in bits mod 2^64 to message
-	# turn the byte length into 2 numbers - high bits and low bits
-	local low_bits=$(( (byte_count << 3) & U32_MASK))
-	local high_bits=$(( (byte_count >> (32 - 3)) & U32_MASK ))
-
-	# encode the full 64bit int (bits length) as big endian
-	local byte
-	for ((i = 3; i >= 0; i--)); do
-		byte=$(( high_bits >> (i * 8) & 0xff ))
-		debug "high_bits[$i]=$byte"
-		process-byte "$byte"
-	done
-	for ((i = 3; i >= 0; i--)); do
-		byte=$(( low_bits >> (i * 8) & 0xff ))
-		debug "low_bits[$i]=$byte"
-		process-byte "$byte"
-	done
-
-	# assert things are correct
-	if (( ${#block[@]} != 0 )); then
-		echo 'uh oh! something went wrong' >&2
-		exit 1
-	fi
+	debug "message was $byte_count bytes"
+	finalize
 }
 
-debug() {
-	if [[ -n $DEBUG ]]; then
-		echo '[DEBUG]' "$@" >&2
-	fi
-	return 0
+# Decoding bytes never touches the hash state, so it overlaps with the strictly
+# serial compression.  Records cross as fixed-width text read back with read -N:
+# bash reads a pipe one byte at a time in line mode, but in bulk when it knows
+# the count.
+
+# the body is a subshell, so shadowing process-block here cannot escape.  The
+# ingest is shared with single-process mode, and only what a finished block
+# does changes.
+pipe-producer() (
+	process-block() {
+		printf '%11d' \
+			"$(( w0 & M ))" "$(( w1 & M ))" "$(( w2 & M ))" "$(( w3 & M ))" \
+			"$(( w4 & M ))" "$(( w5 & M ))" "$(( w6 & M ))" "$(( w7 & M ))" \
+			"$(( w8 & M ))" "$(( w9 & M ))" "$(( w10 & M ))" "$(( w11 & M ))" \
+			"$(( w12 & M ))" "$(( w13 & M ))" "$(( w14 & M ))" "$(( w15 & M ))"
+	}
+	process-input
+)
+
+pipe-consumer() {
+	while IFS= read -r -N "$RECLEN" rec; do
+		decode-record
+		process-block
+	done
+
+	# a leftover partial record means the producer stopped mid-stream
+	[[ -z $rec ]] || return 1
+
+	print-hash
 }
 
 print-hash() {
@@ -244,15 +429,35 @@ print-hash() {
 main() {
 	local file=$1
 
-	if [[ -n $file ]]; then
-		debug "reading data from file: $file"
-		process-input < "$file" || return 1
-	else
-		debug "reading data from stdin"
-		process-input
+	# single-process paths
+	if [[ -n $DEBUG || $SHA256_PROCS == 1 ]]; then
+		local reader=process-input
+		[[ -n $DEBUG ]] && reader=process-input-debug
+
+		if [[ -n $file ]]; then
+			debug "reading data from file: $file"
+			"$reader" < "$file" || return 1
+		else
+			debug 'reading data from stdin'
+			"$reader"
+		fi
+
+		print-hash
+		return 0
 	fi
 
-	print-hash
+	if [[ -n $file ]]; then
+		{ pipe-producer | pipe-consumer; } < "$file"
+	else
+		pipe-producer | pipe-consumer
+	fi
+
+	# read cannot tell a failed producer from end of input, so check both
+	# halves.  The plain status catches the redirection failing outright,
+	# in which case neither half ran and PIPESTATUS is stale.
+	local status=$? pipe=("${PIPESTATUS[@]}")
+	(( status == 0 )) || return 1
+	(( pipe[0] == 0 && pipe[1] == 0 ))
 }
 
 main "$@"
