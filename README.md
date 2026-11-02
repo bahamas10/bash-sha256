@@ -18,8 +18,9 @@ YouTube
 
 Watch me build this live on YouTube.
 
-<a href="https://www.youtube.com/watch?v=GXibFvdKiO8"><img alt="Bash sha256 YouTube
-Thumbnail" src="https://files.daveeddy.com/ysap/bash-sha256-thumbnail.jpg"
+<a href="https://www.youtube.com/watch?v=GXibFvdKiO8"><img
+alt="Bash sha256 YouTube Thumbnail"
+src="https://i.ytimg.com/vi/GXibFvdKiO8/maxresdefault.jpg"
 /></a>
 
 License
