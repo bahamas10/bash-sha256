@@ -84,21 +84,19 @@ process-block() {
 	# message schedule array:
 	local s0 s1
 	for ((i = 16; i < 64; i++)); do
-		s0=$((
-			(
+		((
+			s0 = (
 				((w[i-15] >> 7) | (w[i-15] << (32 - 7))) ^
 				((w[i-15] >> 18) | (w[i-15] << (32 - 18))) ^
 				(w[i-15] >> 3)
-			) & U32_MASK
-		))
-		s1=$((
-			(
+			) & U32_MASK,
+			s1 = (
 				((w[i-2] >> 17) | (w[i-2] << (32 - 17))) ^
 				((w[i-2] >> 19) | (w[i-2] << (32 - 19))) ^
 				(w[i-2] >> 10)
-			) & U32_MASK
+			) & U32_MASK,
+			w[i] = (w[i-16] + s0 + w[i-7] + s1) & U32_MASK
 		))
-		w[i]=$(( (w[i-16] + s0 + w[i-7] + s1) & U32_MASK ))
 	done
 
 	# Initialize working variables to current hash value:
@@ -114,40 +112,40 @@ process-block() {
 	# Compression function main loop:
 	local S1 ch temp1 S0 maj temp2
 	for ((i = 0; i < 64; i++)); do
-		S1=$((
-			((e >> 6) | (e << (32 - 6))) ^
-			((e >> 11) | (e << (32 - 11))) ^
-			((e >> 25) | (e << (32 - 25)))
-		))
-		ch=$(( (e & f) ^ ((~e) & g) ))
-		temp1=$(( (h + S1 + ch + k[i] + w[i]) & U32_MASK ))
-		S0=$((
-			((a >> 2) | (a << (32 - 2))) ^
-			((a >> 13) | (a << (32 - 13))) ^
-			((a >> 22) | (a << (32 - 22)))
-		))
-		maj=$(( (a & b) ^ (a & c) ^ (b & c) ))
-		temp2=$(( (S0 + maj) & U32_MASK ))
+		((
+			S1 = ((e >> 6) | (e << (32 - 6))) ^
+				((e >> 11) | (e << (32 - 11))) ^
+				((e >> 25) | (e << (32 - 25))),
+			ch = (e & f) ^ ((~e) & g),
+			temp1 = (h + S1 + ch + k[i] + w[i]) & U32_MASK,
+			S0 = ((a >> 2) | (a << (32 - 2))) ^
+				((a >> 13) | (a << (32 - 13))) ^
+				((a >> 22) | (a << (32 - 22))),
+			maj = (a & b) ^ (a & c) ^ (b & c),
+			temp2 = (S0 + maj) & U32_MASK,
 
-		h=$g
-		g=$f
-		f=$e
-		e=$(( (d + temp1) & U32_MASK ))
-		d=$c
-		c=$b
-		b=$a
-		a=$(( (temp1 + temp2) & U32_MASK ))
+			h = g,
+			g = f,
+			f = e,
+			e = (d + temp1) & U32_MASK,
+			d = c,
+			c = b,
+			b = a,
+			a = (temp1 + temp2) & U32_MASK
+		))
 	done
 
 	# Add the compressed chunk to the current hash value:
-	h0=$(( (h0 + a) & U32_MASK ))
-	h1=$(( (h1 + b) & U32_MASK ))
-	h2=$(( (h2 + c) & U32_MASK ))
-	h3=$(( (h3 + d) & U32_MASK ))
-	h4=$(( (h4 + e) & U32_MASK ))
-	h5=$(( (h5 + f) & U32_MASK ))
-	h6=$(( (h6 + g) & U32_MASK ))
-	h7=$(( (h7 + h) & U32_MASK ))
+	((
+		h0 = (h0 + a) & U32_MASK,
+		h1 = (h1 + b) & U32_MASK,
+		h2 = (h2 + c) & U32_MASK,
+		h3 = (h3 + d) & U32_MASK,
+		h4 = (h4 + e) & U32_MASK,
+		h5 = (h5 + f) & U32_MASK,
+		h6 = (h6 + g) & U32_MASK,
+		h7 = (h7 + h) & U32_MASK
+	))
 }
 
 process-byte() {
